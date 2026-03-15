@@ -1,0 +1,22 @@
+# Ambientes Virtuais
+venv/
+env/
+.env
+
+# Cache do Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Banco de Dados Vetorial
+faiss_index/
+
+# Arquivos gerados pelo nosso MCP e testes
+dados_permitidos/
+mcp_security.log
+triagem_paciente.txt
+
+# Arquivos do Sistema Operacional
+.DS_Store
+Thumbs.db
