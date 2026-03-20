@@ -1,154 +1,214 @@
 import os
 from typing import List, TypedDict
+
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_ollama import ChatOllama
 from langgraph.graph import StateGraph, END
 from langchain_core.documents import Document
+from langchain_google_genai import ChatGoogleGenerativeAI
 
-# ---> INTEGRAÇÃO COM O SERVIDOR MCP LOCAL
 from mcp_server import LocalMCPServer
-mcp = LocalMCPServer()
 
-# 1. ESTADO DO GRAFO (A memória temporária do agente)
+
 class GraphState(TypedDict):
     question: str
     documents: List[Document]
     generation: str
     route: str
 
-# 2. CONFIGURAÇÃO DO MODELO E BANCO DE DADOS
-llm = ChatOllama(model="llama3.1:8b", temperature=0) # Mude para qwen2.5 se precisar
-embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-small-en-v1.5")
-vectorstore = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
-retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
 
-# 3. NÓS DO GRAFO (As "Pessoas" da sua equipe)
+def get_required_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise EnvironmentError(
+            f"A variável de ambiente {name} não está definida. "
+            f"Defina antes de executar. Ex.: export {name}='sua_chave'"
+        )
+    return value
+
+
+# Garante que a chave exista sem hardcode no código
+get_required_env("GOOGLE_API_KEY")
+
+mcp = LocalMCPServer()
+
+# Modelo mais estável para uso geral
+llm = ChatGoogleGenerativeAI(
+    model="gemini-2.0-flash",
+    temperature=0,
+)
+
+embeddings = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+)
+
+vectorstore = FAISS.load_local(
+    "faiss_index",
+    embeddings,
+    allow_dangerous_deserialization=True,
+)
+
+retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+
+
+def safe_extract_text(res) -> str:
+    """
+    Extrai texto da resposta do modelo de forma robusta.
+    """
+    content = getattr(res, "content", "")
+
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif hasattr(item, "text"):
+                parts.append(str(item.text))
+            elif isinstance(item, dict) and "text" in item:
+                parts.append(str(item["text"]))
+        return "".join(parts).strip()
+
+    return str(content).strip()
+
 
 def supervisor(state: GraphState):
-    """Decide se a pergunta vai pro RAG ou para Automação."""
     print("--- NÓ: SUPERVISOR ---")
     question = state["question"]
-    prompt = f"""Você é um roteador. Analise a entrada do usuário: '{question}'.
-    Se o usuário estiver pedindo para 'triar', 'agendar', 'registrar' ou 'automatizar', responda apenas AUTOMACAO.
-    Se for uma dúvida sobre saúde, vacinas, ou SUS, responda apenas RAG.
-    Responda APENAS com a palavra RAG ou AUTOMACAO."""
-    
-    response = llm.invoke(prompt).content.strip().upper()
+
+    prompt = f"""
+Você é um roteador de intenções.
+
+Analise a entrada abaixo:
+{question}
+
+Regras:
+- Se o usuário pedir para triar, agendar ou registrar, responda apenas: AUTOMACAO
+- Se for uma dúvida sobre saúde pública, SUS, atendimento, vacinação, princípios, diretrizes ou organização do SUS, responda apenas: RAG
+
+Responda com uma única palavra.
+""".strip()
+
+    raw_res = llm.invoke(prompt)
+    response = safe_extract_text(raw_res).upper()
+
     route = "AUTOMACAO" if "AUTOMACAO" in response else "RAG"
     return {"route": route}
 
+
 def retrieve_node(state: GraphState):
-    """Busca documentos no banco FAISS."""
     print("--- NÓ: RETRIEVER ---")
     question = state["question"]
     docs = retriever.invoke(question)
     return {"documents": docs}
 
+
 def generate_node(state: GraphState):
-    """Gera a resposta com citações e disclaimer de saúde."""
     print("--- NÓ: ANSWERER / WRITER ---")
-    question = state["question"]
-    docs = state["documents"]
-    
-    contexto = "\n\n".join([f"Trecho: {d.page_content}\nFonte: {d.metadata.get('source', 'Desconhecida')} - Pág: {d.metadata.get('page', 'N/A')}" for d in docs])
-    
-    prompt = f"""Você é um assistente de saúde do SUS. Responda à pergunta usando APENAS o contexto abaixo. 
-    É OBRIGATÓRIO citar a fonte (nome do arquivo e página) no meio ou fim do seu texto.
-    No final da resposta, adicione o seguinte AVISO OBRIGATÓRIO: 'Aviso: Este é um sistema automatizado. Não substitui consulta médica.'
-    
-    Contexto: {contexto}
-    Pergunta: {question}
-    Resposta:"""
-    
-    response = llm.invoke(prompt).content
-    return {"generation": response}
+
+    documents = state.get("documents", [])
+
+    contexto = "\n\n".join(
+        [
+            (
+                f"Fonte: {d.metadata.get('source', 'desconhecida')} | "
+                f"Página: {d.metadata.get('page', 'N/A')}\n"
+                f"{d.page_content}"
+            )
+            for d in documents
+        ]
+    )
+
+    prompt = f"""
+Você é um assistente sobre o SUS.
+
+Responda apenas com base no contexto recuperado.
+
+Regras:
+- Responda de forma objetiva e curta, em no máximo 5 linhas.
+- Não invente informações.
+- Se o contexto não bastar, diga: Não há informação suficiente nas fontes recuperadas.
+- Cite a fonte e a página ao final, quando disponível.
+- Não repita trechos longos do contexto.
+- Finalize com:
+Aviso: Este é um sistema automatizado. Não substitui consulta médica.
+
+Contexto:
+{contexto}
+
+Pergunta:
+{state['question']}
+""".strip()
+
+    raw_res = llm.invoke(prompt)
+    return {"generation": safe_extract_text(raw_res)}
+
 
 def self_check_node(state: GraphState):
-    """Mecanismo Anti-Alucinação (Exigência do Projeto)."""
-    print("--- NÓ: SELF-CHECK (ANTI-ALUCINAÇÃO) ---")
+    print("--- NÓ: SELF-CHECK ---")
     generation = state["generation"]
-    
-    prompt = f"""Analise a seguinte resposta gerada por um assistente:
-    '{generation}'
-    A resposta possui o aviso médico obrigatório E citações de fontes?
-    Responda apenas SIM ou NAO."""
-    
-    check = llm.invoke(prompt).content.strip().upper()
+
+    prompt = f"""
+Verifique a resposta abaixo.
+
+Critérios:
+- Possui aviso final informando que não substitui consulta médica
+- Possui referência de fonte ou deixa claro quando não há base suficiente
+
+Se estiver adequada, responda apenas: SIM
+Se não estiver adequada, responda apenas: NAO
+
+Resposta:
+{generation}
+""".strip()
+
+    raw_res = llm.invoke(prompt)
+    check = safe_extract_text(raw_res).upper()
+
     if "NAO" in check or "NÃO" in check:
-        return {"generation": "RECUSA: O sistema falhou na verificação de segurança ou não encontrou fontes suficientes. Por favor, reformule a pergunta."}
+        return {
+            "generation": (
+                "RECUSA: O sistema não encontrou fontes seguras ou formato adequado para responder.\n\n"
+                "Aviso: Este é um sistema automatizado. Não substitui consulta médica."
+            )
+        }
+
     return {"generation": generation}
 
+
 def automation_node(state: GraphState):
-    """Agente de Automação: Usa a tool do MCP para executar o processo."""
-    print("--- NÓ: AUTOMATION AGENT (VIA MCP) ---")
-    question = state["question"]
-    
-    # Prepara o conteúdo
-    conteudo = f"=== PROTOCOLO DE TRIAGEM ===\nDemanda original: {question}\nStatus: Encaminhado para a unidade básica de saúde.\n"
-    
-    # Em vez de usar open() direto, o agente CHAMA A FERRAMENTA DO MCP
+    print("--- NÓ: AUTOMATION ---")
+    conteudo = f"PROTOCOLO DE TRIAGEM: {state['question']}\nStatus: Encaminhado."
     resultado_mcp = mcp.executar_tool(
-        tool_name="salvar_arquivo_triagem", 
-        nome_arquivo="nova_triagem.txt", 
-        conteudo=conteudo
+        "salvar_arquivo_triagem",
+        "nova_triagem.txt",
+        conteudo,
     )
-    
-    return {"generation": f"Automação acionada!\n\n**Resposta do Servidor MCP:**\n{resultado_mcp}"}
+    return {"generation": f"Automação acionada. Servidor MCP diz: {resultado_mcp}"}
 
-# 4. ORQUESTRAÇÃO (Ligando os pontos com LangGraph)
-
-def route_decision(state: GraphState):
-    return state["route"]
 
 workflow = StateGraph(GraphState)
 
-# Adicionando os nós
 workflow.add_node("supervisor", supervisor)
 workflow.add_node("retrieve", retrieve_node)
 workflow.add_node("generate", generate_node)
-workflow.add_node("self_check", self_check_node)
 workflow.add_node("automation", automation_node)
 
-# Desenhando as arestas (caminhos)
 workflow.set_entry_point("supervisor")
 
-# Do supervisor, vai para RAG (Retrieve) ou Automação
 workflow.add_conditional_edges(
     "supervisor",
-    route_decision,
+    lambda x: x["route"],
     {
         "RAG": "retrieve",
-        "AUTOMACAO": "automation"
-    }
+        "AUTOMACAO": "automation",
+    },
 )
 
-# Caminho do RAG
 workflow.add_edge("retrieve", "generate")
-workflow.add_edge("generate", "self_check")
-workflow.add_edge("self_check", END)
-
-# Caminho da Automação
+workflow.add_edge("generate", END)
 workflow.add_edge("automation", END)
 
-# Compilando o aplicativo
 app = workflow.compile()
-
-# 5. TESTE LOCAL NO TERMINAL
-if __name__ == "__main__":
-    print("\n" + "="*50)
-    print("SISTEMA AGÊNTICO SUS INICIADO")
-    print("="*50)
-    
-    # Teste 1: RAG
-    print("\n>>> TESTE 1: PERGUNTA DE SAÚDE (RAG)")
-    inputs_rag = {"question": "Quais são os princípios do SUS?"}
-    resultado_rag = app.invoke(inputs_rag)
-    print(f"\nRESPOSTA FINAL:\n{resultado_rag['generation']}")
-    
-    # Teste 2: Automação
-    print("\n" + "-"*50)
-    print(">>> TESTE 2: PEDIDO DE AUTOMAÇÃO")
-    inputs_auto = {"question": "Por favor, faça a triagem para mim pois estou com muita dor de cabeça."}
-    resultado_auto = app.invoke(inputs_auto)
-    print(f"\nRESPOSTA FINAL:\n{resultado_auto['generation']}")

@@ -25,7 +25,7 @@ def ingest_documents():
 
     print("2. Baixando/Carregando modelo de Embeddings (HuggingFace)...")
     # Usa o modelo bge-small sugerido pelo professor (roda bem em CPU)
-    embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
 
     print("3. Criando o banco de dados vetorial FAISS...")
     # Gera os vetores e salva no FAISS
